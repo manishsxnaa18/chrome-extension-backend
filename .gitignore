@@ -1,0 +1,8 @@
+.venv/
+.paddle-cache/
+uploads/
+node_modules/
+.DS_Store
+.env
+__pycache__/
+*.pyc
