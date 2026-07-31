@@ -22,6 +22,7 @@ const upload = multer({
 const port = process.env.PORT || 3000;
 const host = process.env.HOST || (process.env.RENDER ? "0.0.0.0" : "127.0.0.1");
 const freeDailyAiCalls = parsePositiveInt(process.env.FREE_DAILY_AI_CALLS ?? process.env.FREE_DAILY_GEMINI_CALLS, 10);
+const aiUsageTimeZone = String(process.env.AI_USAGE_TIME_ZONE || "Asia/Kolkata").trim() || "Asia/Kolkata";
 const adminApiKey = String(process.env.ADMIN_API_KEY || "").trim();
 const supabase = createSupabaseClient();
 const aiUsageByClient = new Map();
@@ -192,7 +193,7 @@ app.post("/ai-fill-map", enforceAiJsonDailyLimit, async (req, res) => {
       return sendAiLimitResponse(res);
     }
 
-    res.json({ ok: true, mappings: result.mappings });
+    res.json({ ok: true, mappings: result.mappings, aiUsage: toPublicAiUsage(usage) });
   } catch (err) {
     handlePublicAiRouteError(err, res);
   }
@@ -286,7 +287,8 @@ async function reconstructExcelWithConfiguredAi(req, res) {
       fields: extraction.fields,
       rawText: extraction.rawText,
       model: "AI",
-      excel
+      excel,
+      aiUsage: toPublicAiUsage(usage)
     });
   } catch (err) {
     handlePublicAiRouteError(err, res);
@@ -312,7 +314,8 @@ async function reconstructHtmlWithConfiguredAi(req, res) {
         type: req.file.mimetype,
         size: req.file.size
       },
-      ...sanitizePublicAiExtraction(extraction)
+      ...sanitizePublicAiExtraction(extraction),
+      aiUsage: toPublicAiUsage(usage)
     });
   } catch (err) {
     handlePublicAiRouteError(err, res);
@@ -326,8 +329,10 @@ async function reconstructHtmlWithProvider(req, res, provider) {
     }
 
     const extraction = await reconstructFormHtmlWithVisionModel(req.file, provider);
+    let usage = null;
+
     if (provider === "gemini") {
-      const usage = await consumeAiUsage(req, res);
+      usage = await consumeAiUsage(req, res);
 
       if (!usage.allowed) {
         return sendAiLimitResponse(res);
@@ -340,7 +345,8 @@ async function reconstructHtmlWithProvider(req, res, provider) {
         type: req.file.mimetype,
         size: req.file.size
       },
-      ...extraction
+      ...extraction,
+      ...(usage ? { aiUsage: toPublicAiUsage(usage) } : {})
     });
   } catch (err) {
     handleRouteError(err, res);
@@ -592,16 +598,24 @@ async function enforceAiRequestLimit(req, res, next, { requireFile }) {
       return sendAiBlockedResponse(res, { provider, limit: quota.limit });
     }
 
-    const usage = supabase
-      ? await recordSupabaseAiUsage({ provider, deviceId, ip, usageDate: today, endpoint, dailyLimit: quota.limit })
-      : recordMemoryAiUsage({ provider, deviceId, ip, usageDate: today, dailyLimit: quota.limit });
+    const used = supabase
+      ? await getSupabaseAiUsageCount({ provider, deviceId, usageDate: today })
+      : getMemoryAiUsageCount({ provider, deviceId, usageDate: today });
 
-    if (!usage.allowed) {
+    if (used >= quota.limit) {
       return sendAiLimitResponse(res, { provider, limit: quota.limit });
     }
 
-    setAiUsageHeaders(res, { provider, limit: quota.limit, remaining: usage.remaining });
-    req.aiUsageContext = { ...usage, provider, limit: quota.limit };
+    setAiUsageHeaders(res, { provider, limit: quota.limit, remaining: Math.max(0, quota.limit - used) });
+    req.aiUsageContext = {
+      provider,
+      deviceId,
+      ip,
+      usageDate: today,
+      endpoint,
+      limit: quota.limit,
+      remaining: Math.max(0, quota.limit - used)
+    };
     next();
   } catch (err) {
     handleRouteError(err, res);
@@ -615,12 +629,44 @@ async function consumeAiUsage(req, res) {
     return { allowed: true, remaining: null };
   }
 
+  const usage = supabase
+    ? await recordSupabaseAiUsage({
+        provider: context.provider,
+        deviceId: context.deviceId,
+        ip: context.ip,
+        usageDate: context.usageDate,
+        endpoint: context.endpoint,
+        dailyLimit: context.limit
+      })
+    : recordMemoryAiUsage({
+        provider: context.provider,
+        deviceId: context.deviceId,
+        ip: context.ip,
+        usageDate: context.usageDate,
+        dailyLimit: context.limit
+      });
+
   setAiUsageHeaders(res, {
     provider: context.provider || getConfiguredAiQuotaProvider(),
     limit: context.limit || freeDailyAiCalls,
-    remaining: context.remaining
+    remaining: usage.remaining
   });
-  return context;
+  return {
+    ...usage,
+    limit: context.limit || freeDailyAiCalls
+  };
+}
+
+function toPublicAiUsage(usage = {}) {
+  const limit = Number(usage.limit || freeDailyAiCalls);
+  const remaining = Math.max(0, Number(usage.remaining || 0));
+
+  return {
+    limit,
+    used: Math.max(0, limit - remaining),
+    remaining,
+    date: usage.usageDate || getUsageDateKey()
+  };
 }
 
 function sendAiLimitResponse(res, { provider = getConfiguredAiQuotaProvider(), limit = freeDailyAiCalls } = {}) {
@@ -651,10 +697,29 @@ async function getSupabaseAiUsageCount({ provider, deviceId, usageDate }) {
   });
 
   if (error) {
+    if (isMissingSupabaseFunctionError(error)) {
+      return getSupabaseAiUsageCountByQuery({ provider, deviceId, usageDate });
+    }
+
     throw new Error(`Could not check AI usage: ${error.message}`);
   }
 
   return Math.max(0, Number(data || 0));
+}
+
+async function getSupabaseAiUsageCountByQuery({ provider, deviceId, usageDate }) {
+  const { count, error } = await supabase
+    .from("ai_usages")
+    .select("id", { count: "exact", head: true })
+    .eq("usage_date", usageDate)
+    .eq("provider", provider)
+    .eq("device_id", deviceId);
+
+  if (error) {
+    throw new Error(`Could not check AI usage: ${error.message}`);
+  }
+
+  return Math.max(0, Number(count || 0));
 }
 
 async function recordSupabaseAiUsage({ provider, deviceId, ip, usageDate, endpoint, dailyLimit = freeDailyAiCalls }) {
@@ -668,6 +733,10 @@ async function recordSupabaseAiUsage({ provider, deviceId, ip, usageDate, endpoi
   });
 
   if (error) {
+    if (isMissingSupabaseFunctionError(error)) {
+      return recordSupabaseAiUsageByQuery({ provider, deviceId, ip, usageDate, endpoint, dailyLimit });
+    }
+
     throw new Error(`Could not record AI usage: ${error.message}`);
   }
 
@@ -676,6 +745,37 @@ async function recordSupabaseAiUsage({ provider, deviceId, ip, usageDate, endpoi
     allowed: Boolean(usage?.allowed),
     remaining: Math.max(0, Number(usage?.remaining || 0))
   };
+}
+
+async function recordSupabaseAiUsageByQuery({ provider, deviceId, ip, usageDate, endpoint, dailyLimit = freeDailyAiCalls }) {
+  const currentCount = await getSupabaseAiUsageCountByQuery({ provider, deviceId, usageDate });
+
+  if (currentCount >= dailyLimit) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  const { error } = await supabase
+    .from("ai_usages")
+    .insert({
+      usage_date: usageDate,
+      provider,
+      ip_address: ip,
+      device_id: deviceId,
+      endpoint
+    });
+
+  if (error) {
+    throw new Error(`Could not record AI usage: ${error.message}`);
+  }
+
+  return {
+    allowed: true,
+    remaining: Math.max(0, dailyLimit - currentCount - 1)
+  };
+}
+
+function isMissingSupabaseFunctionError(error) {
+  return String(error?.message || "").toLowerCase().includes("could not find the function");
 }
 
 function getMemoryAiUsageCount({ provider, deviceId, usageDate }) {
@@ -791,7 +891,18 @@ function getClientIp(req) {
 }
 
 function getUsageDateKey(date = new Date()) {
-  return date.toISOString().slice(0, 10);
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: aiUsageTimeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(date);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${values.year}-${values.month}-${values.day}`;
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
 }
 
 function pruneOldUsage(today) {
