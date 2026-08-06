@@ -14,6 +14,18 @@ const HTML_RECONSTRUCTION_PROMPT = [
   "If no filled values are visible, return an empty fields object."
 ].join(" ");
 
+const TEXT_EXTRACTION_PROMPT = [
+  "Extract the visible text and filled form values from this form image.",
+  "Do not recreate layout and do not generate HTML.",
+  "Return compact, accurate text suitable for review and form filling.",
+  "Preserve useful line breaks in rawText.",
+  "Extract visible filled values into a flat JSON object named fields.",
+  "Use snake_case keys such as name, date_of_birth, phone, email, address, class, company_name, reference_number.",
+  "Return only valid JSON, not markdown, not explanations, and no code fences.",
+  "Use exactly this shape: {\"rawText\":\"visible text here\",\"fields\":{\"name\":\"...\"}}.",
+  "If no filled values are visible, return an empty fields object."
+].join(" ");
+
 const VISION_PROVIDERS = {
   qwen: {
     label: "Qwen2.5-VL",
@@ -50,12 +62,13 @@ const VISION_PROVIDERS = {
   }
 };
 
-export async function reconstructFormHtmlWithConfiguredAi(file) {
+export async function reconstructFormHtmlWithConfiguredAi(file, options = {}) {
   const primaryProvider = getConfiguredAiProviderName("AI_VISION_PROVIDER", "gemini");
   const fallbackProvider = getConfiguredAiProviderName("AI_VISION_FALLBACK_PROVIDER", "");
+  const outputMode = normalizeVisionOutputMode(options.mode);
 
   try {
-    return await reconstructFormHtmlWithVisionModel(file, primaryProvider);
+    return await reconstructFormHtmlWithVisionModel(file, primaryProvider, { mode: outputMode });
   } catch (err) {
     if (!fallbackProvider || fallbackProvider === primaryProvider || !shouldTryFallback(err)) {
       throw err;
@@ -64,7 +77,7 @@ export async function reconstructFormHtmlWithConfiguredAi(file) {
     console.warn(`${primaryProvider} vision provider failed. Trying ${fallbackProvider} fallback.`);
 
     try {
-      const extraction = await reconstructFormHtmlWithVisionModel(file, fallbackProvider);
+      const extraction = await reconstructFormHtmlWithVisionModel(file, fallbackProvider, { mode: outputMode });
       return {
         ...extraction,
         primaryProvider,
@@ -77,22 +90,23 @@ export async function reconstructFormHtmlWithConfiguredAi(file) {
   }
 }
 
-export async function reconstructFormHtmlWithVisionModel(file, providerName) {
+export async function reconstructFormHtmlWithVisionModel(file, providerName, options = {}) {
   const provider = getVisionProvider(providerName);
   const endpoint = process.env[provider.urlEnv] || provider.defaultUrl;
   const model = process.env[provider.modelEnv] || provider.defaultModel;
   const apiKey = process.env[provider.apiKeyEnv];
   const imageBase64 = file.buffer.toString("base64");
   const mimeType = file.mimetype || "image/png";
+  const outputMode = normalizeVisionOutputMode(options.mode);
 
   if (provider.format === "gemini-interactions") {
-    return reconstructFormHtmlWithGemini({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType });
+    return reconstructFormHtmlWithGemini({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType, outputMode });
   }
 
-  return reconstructFormHtmlWithOpenRouterCompatible({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType });
+  return reconstructFormHtmlWithOpenRouterCompatible({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType, outputMode });
 }
 
-async function reconstructFormHtmlWithOpenRouterCompatible({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType }) {
+async function reconstructFormHtmlWithOpenRouterCompatible({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType, outputMode }) {
   if (providerName === "openrouter" && !apiKey) {
     throw createVisionError(provider, `${provider.apiKeyEnv} is required.`);
   }
@@ -130,7 +144,8 @@ async function reconstructFormHtmlWithOpenRouterCompatible({ provider, providerN
         model: modelCandidate,
         headers,
         imageBase64,
-        mimeType
+        mimeType,
+        outputMode
       });
     } catch (err) {
       lastError = err;
@@ -146,21 +161,21 @@ async function reconstructFormHtmlWithOpenRouterCompatible({ provider, providerN
   throw lastError || createVisionError(provider, "No OpenRouter vision models were available.");
 }
 
-async function requestOpenRouterCompatibleReconstruction({ provider, providerName, endpoint, model, headers, imageBase64, mimeType }) {
+async function requestOpenRouterCompatibleReconstruction({ provider, providerName, endpoint, model, headers, imageBase64, mimeType, outputMode }) {
   const response = await fetch(endpoint, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
       temperature: 0.1,
-      max_tokens: 6000,
+      max_tokens: outputMode === "text" ? 1800 : 6000,
       messages: [
         {
           role: "user",
           content: [
             {
               type: "text",
-              text: HTML_RECONSTRUCTION_PROMPT
+              text: getVisionPrompt(outputMode)
             },
             {
               type: "image_url",
@@ -187,28 +202,29 @@ async function requestOpenRouterCompatibleReconstruction({ provider, providerNam
 
   const data = await response.json();
   const reconstruction = parseReconstructionResponse(readChatCompletionText(data));
-  const html = reconstruction.html;
-  const rawText = htmlToText(html) || fieldsToText(reconstruction.fields);
+  const html = outputMode === "html" ? reconstruction.html : "";
+  const rawText = reconstruction.rawText || htmlToText(html) || fieldsToText(reconstruction.fields);
   const actualModel = data?.model || model;
   assertVisionReconstruction(provider, providerName, {
     html,
     fields: reconstruction.fields,
     rawText,
-    model: actualModel
+    model: actualModel,
+    outputMode
   });
 
   return {
     fields: addRawTextField(reconstruction.fields, rawText),
     rawText,
     html,
-    htmlMode: `${providerName}-ai-reconstruction`,
+    htmlMode: outputMode === "text" ? `${providerName}-ai-text-extraction` : `${providerName}-ai-reconstruction`,
     unmatched: [],
-    model: `${providerName}-vision-html:${actualModel}`,
+    model: `${providerName}-vision-${outputMode}:${actualModel}`,
     endpoint
   };
 }
 
-async function reconstructFormHtmlWithGemini({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType }) {
+async function reconstructFormHtmlWithGemini({ provider, providerName, endpoint, model, apiKey, imageBase64, mimeType, outputMode }) {
   if (!apiKey) {
     throw createVisionError(provider, `${provider.apiKeyEnv} is required.`);
   }
@@ -224,7 +240,7 @@ async function reconstructFormHtmlWithGemini({ provider, providerName, endpoint,
       input: [
         {
           type: "text",
-          text: HTML_RECONSTRUCTION_PROMPT
+          text: getVisionPrompt(outputMode)
         },
         {
           type: "image",
@@ -248,22 +264,23 @@ async function reconstructFormHtmlWithGemini({ provider, providerName, endpoint,
 
   const data = await response.json();
   const reconstruction = parseReconstructionResponse(readGeminiInteractionText(data));
-  const html = reconstruction.html;
-  const rawText = htmlToText(html) || fieldsToText(reconstruction.fields);
+  const html = outputMode === "html" ? reconstruction.html : "";
+  const rawText = reconstruction.rawText || htmlToText(html) || fieldsToText(reconstruction.fields);
   assertVisionReconstruction(provider, providerName, {
     html,
     fields: reconstruction.fields,
     rawText,
-    model
+    model,
+    outputMode
   });
 
   return {
     fields: addRawTextField(reconstruction.fields, rawText),
     rawText,
     html,
-    htmlMode: `${providerName}-ai-reconstruction`,
+    htmlMode: outputMode === "text" ? `${providerName}-ai-text-extraction` : `${providerName}-ai-reconstruction`,
     unmatched: [],
-    model: `${providerName}-vision-html:${model}`,
+    model: `${providerName}-vision-${outputMode}:${model}`,
     endpoint
   };
 }
@@ -294,6 +311,14 @@ export function getConfiguredAiVisionStatus() {
 function getConfiguredAiProviderName(envName, fallback) {
   const providerName = String(process.env[envName] || fallback || "").trim().toLowerCase();
   return providerName || "";
+}
+
+function normalizeVisionOutputMode(value) {
+  return String(value || "").trim().toLowerCase() === "html" ? "html" : "text";
+}
+
+function getVisionPrompt(outputMode) {
+  return outputMode === "html" ? HTML_RECONSTRUCTION_PROMPT : TEXT_EXTRACTION_PROMPT;
 }
 
 function shouldTryFallback(err) {
@@ -411,16 +436,19 @@ function parseReconstructionResponse(value) {
 
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     const html = normalizeHtmlResponse(parsed.html || parsed.form_html || parsed.markup || "");
+    const rawText = String(parsed.rawText || parsed.raw_text || parsed.text || parsed.raw || "").trim();
     const fields = normalizeFields(parsed.fields || parsed.data || parsed.values || {});
 
     return {
       html,
+      rawText,
       fields
     };
   }
 
   return {
     html: normalizeHtmlResponse(text),
+    rawText: text,
     fields: {}
   };
 }
@@ -488,6 +516,7 @@ function fieldsToText(fields) {
 function assertVisionReconstruction(provider, providerName, reconstruction) {
   const html = String(reconstruction.html || "").trim();
   const rawText = String(reconstruction.rawText || "").trim();
+  const outputMode = normalizeVisionOutputMode(reconstruction.outputMode);
   const model = String(reconstruction.model || "").trim();
   const fieldKeys = Object.keys(reconstruction.fields || {}).filter((key) => key !== "raw_text");
   const combinedText = `${model}\n${html}\n${rawText}\n${fieldsToText(reconstruction.fields)}`.toLowerCase();
@@ -496,6 +525,16 @@ function assertVisionReconstruction(provider, providerName, reconstruction) {
     throw createVisionError(provider, `OpenRouter selected a non-vision safety model (${model || "unknown model"}). Set OPENROUTER_MODEL to a vision model.`, {
       status: 502
     });
+  }
+
+  if (outputMode === "text") {
+    if (!rawText && !fieldKeys.length) {
+      throw createVisionError(provider, "The model returned empty text extraction.", {
+        status: 502
+      });
+    }
+
+    return;
   }
 
   if (!html) {

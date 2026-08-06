@@ -270,7 +270,7 @@ async function reconstructExcelWithConfiguredAi(req, res) {
       return res.status(400).json({ error: "File is required." });
     }
 
-    const extraction = await reconstructFormHtmlWithConfiguredAi(req.file);
+    const extraction = await reconstructFormHtmlWithConfiguredAi(req.file, { mode: "text" });
     const excel = await createExcelExport(extraction, req.file.originalname);
     const usage = await consumeAiUsage(req, res);
 
@@ -301,7 +301,7 @@ async function reconstructHtmlWithConfiguredAi(req, res) {
       return res.status(400).json({ error: "File is required." });
     }
 
-    const extraction = await reconstructFormHtmlWithConfiguredAi(req.file);
+    const extraction = await reconstructFormHtmlWithConfiguredAi(req.file, { mode: getAiGenerationMode(req) });
     const usage = await consumeAiUsage(req, res);
 
     if (!usage.allowed) {
@@ -328,7 +328,7 @@ async function reconstructHtmlWithProvider(req, res, provider) {
       return res.status(400).json({ error: "File is required." });
     }
 
-    const extraction = await reconstructFormHtmlWithVisionModel(req.file, provider);
+    const extraction = await reconstructFormHtmlWithVisionModel(req.file, provider, { mode: getAiGenerationMode(req) });
     let usage = null;
 
     if (provider === "gemini") {
@@ -923,13 +923,18 @@ function setAiUsageHeaders(res, { provider, limit, remaining }) {
 function sanitizePublicAiExtraction(extraction = {}) {
   return {
     ...extraction,
-    htmlMode: "ai-reconstruction",
+    htmlMode: String(extraction.htmlMode || "").includes("text-extraction") ? "ai-text-extraction" : "ai-reconstruction",
     model: "AI",
     endpoint: undefined,
     primaryProvider: undefined,
     fallbackProvider: undefined,
     fallbackReason: undefined
   };
+}
+
+function getAiGenerationMode(req) {
+  const mode = String(req.body?.generationMode || req.body?.mode || "").trim().toLowerCase();
+  return mode === "html" ? "html" : "text";
 }
 
 function handlePublicAiRouteError(err, res) {
